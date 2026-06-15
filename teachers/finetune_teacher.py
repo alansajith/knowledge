@@ -15,6 +15,12 @@ Targets NVIDIA GPU cluster (Google Cloud / University) — PyTorch CUDA, PEFT fo
 import argparse
 import json
 import os
+import sys
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
 import pandas as pd
@@ -22,12 +28,15 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
+from utils.paths import get_project_paths
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+paths = get_project_paths(__file__)
+DATA_DIR = paths["DATA_DIR"]
+SCRIPT_DIR = paths["TEACHERS_DIR"]
+PROJECT_ROOT = paths["PROJECT_ROOT"]
 
 TEACHER_SPLITS = {"A": "split_A.csv", "B": "split_B.csv", "C": "split_C.csv"}
 

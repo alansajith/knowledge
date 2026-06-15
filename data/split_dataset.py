@@ -18,6 +18,12 @@ import argparse
 import os
 import sys
 
+# Allow importing utils regardless of where the script is launched from
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import numpy as np
 import pandas as pd
 import torch
@@ -28,11 +34,14 @@ from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
+from utils.paths import get_project_paths
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SOURCE_CSV = os.path.join(os.path.dirname(__file__), "veremi.csv")
-DATA_DIR = os.path.dirname(__file__)
+paths = get_project_paths(__file__)
+DATA_DIR = paths["DATA_DIR"]
+SOURCE_CSV = os.path.join(DATA_DIR, "veremi.csv")
 
 # Numeric label mapping (0=benign handled separately)
 ATTACK_MAP = {
@@ -351,10 +360,10 @@ def main():
     # 0) Handle missing dataset — copy from repo root if needed
     # ------------------------------------------------------------------
     if not os.path.exists(SOURCE_CSV):
-        fallback = os.path.join(os.path.dirname(DATA_DIR), "Veremi_final_dataset.csv")
+        fallback = os.path.join(paths["PROJECT_ROOT"], "Veremi_final_dataset.csv")
         if os.path.exists(fallback):
             print(f"Copying {fallback} → {SOURCE_CSV}")
-            os.makedirs(DATA_DIR, exist_ok=True)
+            os.makedirs(paths["DATA_DIR"], exist_ok=True)
             import shutil
             shutil.copy2(fallback, SOURCE_CSV)
         else:

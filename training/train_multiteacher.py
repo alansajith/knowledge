@@ -19,6 +19,11 @@ import csv
 import os
 import sys
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import numpy as np
 import pandas as pd
 import torch
@@ -29,13 +34,16 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
+from utils.paths import get_project_paths
+
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-TEACHERS_DIR = os.path.join(PROJECT_ROOT, "teachers")
+paths = get_project_paths(__file__)
+SCRIPT_DIR = paths["TRAINING_DIR"]
+PROJECT_ROOT = paths["PROJECT_ROOT"]
+DATA_DIR = paths["DATA_DIR"]
+TEACHERS_DIR = paths["TEACHERS_DIR"]
 CHECKPOINT_PATH = os.path.join(SCRIPT_DIR, "best_model.pt")
 LOG_PATH = os.path.join(SCRIPT_DIR, "training_log.csv")
 
