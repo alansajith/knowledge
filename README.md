@@ -4,14 +4,14 @@
 
 A research project for IoV (Internet of Vehicles) security that improves upon single-teacher distillation by using **three specialized teacher LLMs** and a **learnable weighted aggregator** to fuse their knowledge into a lightweight BiLSTM student.
 
-Hardware target: **Apple M4 Pro with 24 GB unified RAM** (MLX + PyTorch MPS).
+Hardware target: **NVIDIA GPU cluster (Google Cloud / University cluster — CUDA via PyTorch)**.
 
 ---
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
-- [Setup (M4 Pro)](#setup-m4-pro)
+- [Setup (GPU Cluster)](#setup-gpu-cluster)
 - [Project Structure](#project-structure)
 - [Run Order](#run-order)
 - [Multi-Teacher Loss Function](#multi-teacher-loss-function)
@@ -59,7 +59,7 @@ VeReMi BSM Data
 
 ---
 
-## Setup (M4 Pro)
+## Setup (GPU Cluster)
 
 > All commands assume you are in the repository root.
 
@@ -71,13 +71,13 @@ source venv/bin/activate
 pip install -r mt_ldi_mds/requirements.txt
 ```
 
-### 2. Ensure MPS is available
+### 2. Ensure CUDA is available
 
 ```bash
-python3 -c "import torch; print(torch.backends.mps.is_available())"
+python3 -c "import torch; print(torch.cuda.is_available())"
 ```
 
-Expected output: `True` on Apple Silicon.
+Expected output: `True` on a CUDA-enabled machine.
 
 ### 3. Download the VeReMi Extension dataset
 
@@ -100,7 +100,7 @@ mt_ldi_mds/
 ├── data/
 │   └── split_dataset.py          # Preprocess, SCL, Z-score, NN search, split A/B/C
 ├── teachers/
-│   └── finetune_teacher.py       # LoRA fine-tuning via mlx-lm + embedding extraction
+│   └── finetune_teacher.py       # LoRA fine-tuning via peft + embedding extraction
 ├── aggregator/
 │   └── weighted_aggregator.py    # Fixed / learnable λ fusion + LinearAdapter
 ├── student/
@@ -131,7 +131,7 @@ Each row includes a `nn_variability` column computed from the top-5 same-class n
 
 ### Step 2 – Teacher Fine-Tuning & Embedding Extraction
 
-Repeat for each teacher (**warning**: each run takes several hours on an M4 Pro):
+Repeat for each teacher:
 
 ```bash
 python teachers/finetune_teacher.py --teacher A
@@ -141,10 +141,9 @@ python teachers/finetune_teacher.py --teacher C
 
 What happens:
 1. Converts the split CSV into instruction-tuning `train.jsonl` / `valid.jsonl`
-2. Generates `teachers/lora_config_{A|B|C}.yaml`
-3. Invokes `mlx_lm.lora --config ...` for LoRA fine-tuning (rank=16, α=32)
-4. Saves adapters to `teachers/teacher_{A|B|C}_adapters/`
-5. Extracts mean-pooled hidden-state embeddings from Qwen/Qwen3-8B and saves them as `teachers/embeddings_{A|B|C}.npy`
+2. Fine-tunes Qwen/Qwen3-8B with LoRA via `peft` (rank=16, alpha=32)
+3. Saves adapters to `teachers/teacher_{A|B|C}_adapters/`
+4. Extracts mean-pooled last-hidden-state embeddings and saves them as `teachers/embeddings_{A|B|C}.npy`
 
 To skip LoRA and only run embedding extraction (e.g. for debugging):
 ```bash
@@ -154,7 +153,7 @@ python teachers/finetune_teacher.py --teacher A --skip-lora
 ### Step 3 – Multi-Teacher Distillation
 
 ```bash
-python training/train_multiteacher.py --mode learnable --epochs 50
+CUDA_VISIBLE_DEVICES=0 python training/train_multiteacher.py --mode learnable --epochs 50
 ```
 
 Arguments:
@@ -167,7 +166,7 @@ Arguments:
 
 The script:
 - Loads the full VeReMi dataset and does a stratified 70/15/15 split
-- Loads teacher embeddings via **memory mapping** (avoids OOM on >24 GB files)
+- Loads teacher embeddings via **memory mapping** (avoids OOM on large files)
 - Projects raw teacher embeddings (4096-dim) → 128-dim via lightweight `TeacherAligner` heads
 - Trains the student with the multi-teacher loss
 - Saves the best checkpoint by validation accuracy
@@ -176,7 +175,7 @@ The script:
 ### Step 4 – Evaluation
 
 ```bash
-python evaluation/evaluate.py --auto-train
+CUDA_VISIBLE_DEVICES=0 python evaluation/evaluate.py --auto-train
 ```
 
 The `--auto-train` flag automatically trains missing baseline checkpoints:
@@ -246,18 +245,17 @@ Example output:
 
 ## Notes & Limitations
 
-- **Embedding memory**: Raw Qwen3-8B embeddings are 4096-dim float32. For the full 22 M-row VeReMi dataset a single teacher embedding file would be ~351 GB, which does not fit on a 24 GB Mac.
+- **Embedding memory**: Raw Qwen3-8B embeddings are 4096-dim float32. For the full 22 M-row VeReMi dataset a single teacher embedding file would be ~351 GB.
   - **Practical workaround**: The training script automatically loads `.npy` files via `np.memmap`, avoiding full RAM residency.
   - **Recommended pipeline**: Extract teacher embeddings **only for the training set** (or downsample the dataset before training).
-- **MLX and PyTorch models**: LoRA fine-tuning runs via `mlx_lm.lora` (MLX), while embedding extraction uses PyTorch/HuggingFace with MPS. The two frameworks are not mixed in the same process.
+- **Teacher fine-tuning**: LoRA fine-tuning uses `peft` + `transformers` with CUDA. The fine-tuned adapter is saved separately and reloaded at embedding-extraction time.
 - **Teacher alignment**: Because raw teacher hidden states (4096-dim) do not match the student's 128-dim intermediate features, `TeacherAligner` projections are added. This is standard practice in feature-based knowledge distillation.
-- **Apple MPS bugs**: If you encounter `RuntimeError: Invalid buffer size` on older `transformers` versions, upgrade to ≥ 4.51 (specified in `requirements.txt`).
 
 ---
 
 ## Citations
 
-If you use this codebase, please cite the original VeReMi dataset and our multi-teacher distilation extension:
+If you use this codebase, please cite the original VeReMi dataset and our multi-teacher distillation extension:
 
 ```bibtex
 @dataset{veremi2019,
@@ -270,4 +268,4 @@ If you use this codebase, please cite the original VeReMi dataset and our multi-
 
 ---
 
-*Built for Apple M4 Pro (24 GB) — MLX + PyTorch MPS backend.*
+*Built for NVIDIA GPU clusters — PyTorch CUDA backend.*

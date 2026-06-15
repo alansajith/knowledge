@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Datasets & generated data
+data/*.csv
+data/*.npy
+teachers/teacher_*_data/
+teachers/teacher_*_adapters/
+teachers/*.npy
+teachers/*.yaml
+
+# Training outputs
+training/*.pt
+training/*.csv
+
+# Evaluation outputs
+evaluation/*.json
+
+# IDE
+.vscode/
+.idea/
