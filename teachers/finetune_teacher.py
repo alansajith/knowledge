@@ -203,7 +203,6 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         fp16=True,
         report_to="none",
         remove_unused_columns=False,
-        max_seq_length=512,
     )
 
     trainer = SFTTrainer(
@@ -213,6 +212,7 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         eval_dataset=val_ds,
         tokenizer=tokenizer,
         dataset_text_field="text",
+        max_seq_length=512,
     )
 
     print("=== Starting LoRA training ===")
