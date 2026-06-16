@@ -160,15 +160,19 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
     config = AutoConfig.from_pretrained(HF_MODEL_NAME, trust_remote_code=False)
     num_layers = config.num_hidden_layers  # e.g. 32 for Qwen3-8B
 
-    # Split layers: GPU 0 gets layers 0..14 (15 layers), GPU 1 gets 15..31 (17 layers) + norm/lm_head
+    # Dynamic split: distribute layers evenly, but GPU 0 gets embed_tokens so give it 2 fewer layers
+    layers_per_gpu = num_layers // num_gpus
     device_map = {"model.embed_tokens": 0}
     for idx in range(num_layers):
-        if idx < 15:
-            device_map[f"model.layers.{idx}"] = 0
+        if idx < layers_per_gpu - 2:
+            gpu_id = 0
         else:
-            device_map[f"model.layers.{idx}"] = 1
-    device_map["model.norm"] = 1
-    device_map["lm_head"] = 1
+            gpu_id = min((idx - (layers_per_gpu - 2)) // layers_per_gpu + 1, num_gpus - 1)
+        device_map[f"model.layers.{idx}"] = gpu_id
+    device_map["model.norm"] = num_gpus - 1
+    device_map["lm_head"] = num_gpus - 1
+
+    print(f"Device map: {device_map}")
 
     model = AutoModelForCausalLM.from_pretrained(
         HF_MODEL_NAME,
