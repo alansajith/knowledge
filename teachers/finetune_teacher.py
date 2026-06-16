@@ -152,17 +152,23 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
 
     from transformers import AutoConfig
 
-    # Build a balanced multi-GPU device map — leave 2 GiB headroom per GPU
-    # to avoid any module being offloaded to CPU
+    import os
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # Build a balanced multi-GPU device map — GPU 0 has embed_tokens so give it fewer layers
     num_gpus = torch.cuda.device_count()
     config = AutoConfig.from_pretrained(HF_MODEL_NAME, trust_remote_code=False)
     num_layers = config.num_hidden_layers  # e.g. 32 for Qwen3-8B
 
-    device_map = {"model.embed_tokens": 0, "model.norm": num_gpus - 1, "lm_head": num_gpus - 1}
-    layers_per_gpu = (num_layers + num_gpus - 1) // num_gpus
+    # Split layers: GPU 0 gets layers 0..14 (15 layers), GPU 1 gets 15..31 (17 layers) + norm/lm_head
+    device_map = {"model.embed_tokens": 0}
     for idx in range(num_layers):
-        gpu_id = min(idx // layers_per_gpu, num_gpus - 1)
-        device_map[f"model.layers.{idx}"] = gpu_id
+        if idx < 15:
+            device_map[f"model.layers.{idx}"] = 0
+        else:
+            device_map[f"model.layers.{idx}"] = 1
+    device_map["model.norm"] = 1
+    device_map["lm_head"] = 1
 
     model = AutoModelForCausalLM.from_pretrained(
         HF_MODEL_NAME,
@@ -170,6 +176,7 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         device_map=device_map,
         trust_remote_code=False,
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
     )
 
     lora_config = LoraConfig(
