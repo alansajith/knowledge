@@ -141,6 +141,9 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    from accelerate import init_empty_weights, infer_auto_device_map
+    from transformers import AutoConfig
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -148,10 +151,22 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         bnb_4bit_use_double_quant=True,
     )
 
+    # Build a balanced multi-GPU device map across all available GPUs
+    config = AutoConfig.from_pretrained(HF_MODEL_NAME, trust_remote_code=False)
+    with init_empty_weights():
+        dummy_model = AutoModelForCausalLM.from_config(config)
+
+    device_map = infer_auto_device_map(
+        dummy_model,
+        max_memory={i: f"{int(torch.cuda.get_device_properties(i).total_memory / 1024**3)}GiB" for i in range(torch.cuda.device_count())},
+        no_split_module_classes=["LlamaDecoderLayer"],
+    )
+    del dummy_model
+
     model = AutoModelForCausalLM.from_pretrained(
         HF_MODEL_NAME,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map=device_map,
         trust_remote_code=False,
         torch_dtype=torch.bfloat16,
     )
