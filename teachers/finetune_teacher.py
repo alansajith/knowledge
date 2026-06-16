@@ -153,7 +153,7 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=False,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     )
 
     lora_config = LoraConfig(
@@ -199,8 +199,8 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         eval_strategy="steps",
         eval_steps=max(len(train_ds) // 10, 100),
         load_best_model_at_end=True,
-        bf16=False,
-        fp16=True,
+        bf16=True,
+        fp16=False,
         report_to="none",
         remove_unused_columns=False,
     )
@@ -210,7 +210,7 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         dataset_text_field="text",
         max_seq_length=512,
     )
@@ -236,7 +236,7 @@ def extract_embeddings(df: pd.DataFrame, teacher: str, batch_size: int = 16):
     tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME, trust_remote_code=False)
     model = AutoModel.from_pretrained(
         HF_MODEL_NAME,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=False,
     )
