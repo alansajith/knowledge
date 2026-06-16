@@ -68,6 +68,10 @@ def get_project_paths(current_file=None):
             if os.path.basename(script_dir) == "utils":
                 script_dir = os.path.dirname(script_dir)
 
+        # If script is in data/ or other subdirectories, go up to project root
+        if os.path.basename(script_dir) in ("data", "utils"):
+            script_dir = os.path.dirname(script_dir)
+
         PROJECT_ROOT = script_dir
         DATA_DIR = os.path.join(PROJECT_ROOT, "data")
         TEACHERS_DIR = os.path.join(PROJECT_ROOT, "teachers")

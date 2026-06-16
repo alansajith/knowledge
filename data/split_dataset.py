@@ -41,8 +41,10 @@ from utils.paths import get_project_paths
 # ---------------------------------------------------------------------------
 paths = get_project_paths(__file__)
 DATA_DIR = paths["DATA_DIR"]
-SOURCE_CSV = os.path.join(DATA_DIR, "veremi.csv")
-
+if os.path.exists("/kaggle/input/datasets/alansajith/veremi-final-dataset/Veremi_final_dataset.csv"):
+    SOURCE_CSV = "/kaggle/input/datasets/alansajith/veremi-final-dataset/Veremi_final_dataset.csv"
+else:
+    SOURCE_CSV = os.path.join(DATA_DIR, "veremi.csv")
 # Numeric label mapping (0=benign handled separately)
 ATTACK_MAP = {
     "DoS": 1,
