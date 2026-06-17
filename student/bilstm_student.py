@@ -20,6 +20,7 @@ for feature-based multi-teacher knowledge distillation.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class BiLSTMStudent(nn.Module):
@@ -29,13 +30,15 @@ class BiLSTMStudent(nn.Module):
     Args:
         input_dim: Number of raw features per BSM sample (e.g., 18 for VeReMi).
         num_classes: Number of output classes (default 9 for VeReMi labels).
+        gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency (default False).
     """
 
-    def __init__(self, input_dim: int, num_classes: int = 9):
+    def __init__(self, input_dim: int, num_classes: int = 9, gradient_checkpointing: bool = False):
         super().__init__()
         self.input_dim = input_dim
         self.num_classes = num_classes
         self._intermediate = None
+        self.gradient_checkpointing = gradient_checkpointing
 
         # ------------------------------------------------------------------
         # 1) Input embedding layer (input_dim → 128)
@@ -114,11 +117,17 @@ class BiLSTMStudent(nn.Module):
         # 3) Permute back to (B, T, 64) for LSTM
         x = x.permute(0, 2, 1)
 
-        # 4) BiLSTM
-        x, _ = self.bilstm(x)  # (B, T, 256)
+        # 4) BiLSTM (with optional gradient checkpointing)
+        if self.gradient_checkpointing and self.training:
+            x, _ = checkpoint(self.bilstm, x, use_reentrant=False)
+        else:
+            x, _ = self.bilstm(x)  # (B, T, 256)
 
         # 5) Multi-head self-attention on the LSTM output
-        attn_out, _ = self.attention(x, x, x)  # (B, T, 256)
+        if self.gradient_checkpointing and self.training:
+            attn_out, _ = checkpoint(self.attention, x, x, x, use_reentrant=False)
+        else:
+            attn_out, _ = self.attention(x, x, x)  # (B, T, 256)
 
         # 6) Residual connection + LayerNorm
         x = self.ln(attn_out + x)  # (B, T, 256)

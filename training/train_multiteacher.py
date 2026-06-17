@@ -37,6 +37,15 @@ from tqdm import tqdm
 from utils.paths import get_project_paths
 
 # ---------------------------------------------------------------------------
+# A100 40GB Optimizations
+# ---------------------------------------------------------------------------
+# Enable TF32 for faster matmul on Ampere GPUs (A100)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# Enable cuDNN benchmark for optimal convolution algorithms
+torch.backends.cudnn.benchmark = True
+
+# ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
 paths = get_project_paths(__file__)
@@ -48,6 +57,13 @@ CHECKPOINT_PATH = os.path.join(SCRIPT_DIR, "best_model.pt")
 LOG_PATH = os.path.join(SCRIPT_DIR, "training_log.csv")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Mixed precision scaler for A100 (BF16 preferred on Ampere)
+USE_AMP = DEVICE.type == "cuda"
+AMP_DTYPE = torch.bfloat16 if DEVICE.type == "cuda" else torch.float32
+
+# GradScaler for mixed precision training
+SCALER = torch.amp.GradScaler(device_type="cuda", enabled=USE_AMP) if USE_AMP else None
 
 # Same mapping as split_dataset.py
 ATTACK_MAP = {
@@ -220,6 +236,8 @@ def evaluate(model, aggregator, aligners, loader, criterion_ce, device, kd_teach
     use_b = "B" in kd_teachers
     use_c = "C" in kd_teachers
 
+    # Mixed precision context for inference
+    autocast_enabled = USE_AMP and device.type == "cuda"
     for batch in loader:
         if has_kd:
             x, y, eA, eB, eC = batch
@@ -233,25 +251,26 @@ def evaluate(model, aggregator, aligners, loader, criterion_ce, device, kd_teach
         x = x.to(device)
         y = y.to(device)
 
-        logits = model(x)
-        ce = criterion_ce(logits, y)
-        loss = ce
+        with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=autocast_enabled):
+            logits = model(x)
+            ce = criterion_ce(logits, y)
+            loss = ce
 
-        if has_kd:
-            student_feat = model.get_intermediate_features()  # (B, 128)
-            w = F.softmax(torch.stack([aggregator.lambda1, aggregator.lambda2, aggregator.lambda3]), dim=0)
-            if use_a and aligners[0] is not None and eA is not None and eA.shape[-1] == aligners[0].linear.in_features:
-                tA = aligners[0](eA)
-                kd_A = F.mse_loss(student_feat, tA)
-                loss = loss + w[0] * kd_A
-            if use_b and aligners[1] is not None and eB is not None and eB.shape[-1] == aligners[1].linear.in_features:
-                tB = aligners[1](eB)
-                kd_B = F.mse_loss(student_feat, tB)
-                loss = loss + w[1] * kd_B
-            if use_c and aligners[2] is not None and eC is not None and eC.shape[-1] == aligners[2].linear.in_features:
-                tC = aligners[2](eC)
-                kd_C = F.mse_loss(student_feat, tC)
-                loss = loss + w[2] * kd_C
+            if has_kd:
+                student_feat = model.get_intermediate_features()  # (B, 128)
+                w = F.softmax(torch.stack([aggregator.lambda1, aggregator.lambda2, aggregator.lambda3]), dim=0)
+                if use_a and aligners[0] is not None and eA is not None and eA.shape[-1] == aligners[0].linear.in_features:
+                    tA = aligners[0](eA)
+                    kd_A = F.mse_loss(student_feat, tA)
+                    loss = loss + w[0] * kd_A
+                if use_b and aligners[1] is not None and eB is not None and eB.shape[-1] == aligners[1].linear.in_features:
+                    tB = aligners[1](eB)
+                    kd_B = F.mse_loss(student_feat, tB)
+                    loss = loss + w[1] * kd_B
+                if use_c and aligners[2] is not None and eC is not None and eC.shape[-1] == aligners[2].linear.in_features:
+                    tC = aligners[2](eC)
+                    kd_C = F.mse_loss(student_feat, tC)
+                    loss = loss + w[2] * kd_C
 
         total_loss += loss.item()
         total_ce += ce.item()
@@ -268,7 +287,7 @@ def evaluate(model, aggregator, aligners, loader, criterion_ce, device, kd_teach
     return avg_loss, avg_ce, acc, f1
 
 
-def train_epoch(model, aggregator, aligners, loader, optimizer, criterion_ce, device, has_kd, kd_teachers="ABC"):
+def train_epoch(model, aggregator, aligners, loader, optimizer, criterion_ce, device, has_kd, kd_teachers="ABC", grad_accum_steps=4):
     """Run one training epoch and return dict of average losses."""
     model.train()
     aggregator.train()
@@ -287,7 +306,10 @@ def train_epoch(model, aggregator, aligners, loader, optimizer, criterion_ce, de
     total_kd_C = 0.0
     count = 0
 
-    for batch in tqdm(loader, desc="Training", leave=False):
+    autocast_enabled = USE_AMP and device.type == "cuda"
+    optimizer.zero_grad()
+
+    for i, batch in enumerate(tqdm(loader, desc="Training", leave=False)):
         if has_kd:
             x, y, eA, eB, eC = batch
             eA = eA.to(device)
@@ -300,39 +322,53 @@ def train_epoch(model, aggregator, aligners, loader, optimizer, criterion_ce, de
         x = x.to(device)
         y = y.to(device)
 
-        optimizer.zero_grad()
-        logits = model(x)
-        ce = criterion_ce(logits, y)
-        loss = ce
+        with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=autocast_enabled):
+            logits = model(x)
+            ce = criterion_ce(logits, y)
+            loss = ce
 
-        kd_A_val = kd_B_val = kd_C_val = torch.tensor(0.0, device=device)
+            kd_A_val = kd_B_val = kd_C_val = torch.tensor(0.0, device=device)
 
-        if has_kd:
-            # Compute λ weights WITH gradient tracking so they learn
-            raw_lambdas = torch.stack([aggregator.lambda1, aggregator.lambda2, aggregator.lambda3])
-            weights = F.softmax(raw_lambdas, dim=0)
+            if has_kd:
+                # Compute λ weights WITH gradient tracking so they learn
+                raw_lambdas = torch.stack([aggregator.lambda1, aggregator.lambda2, aggregator.lambda3])
+                weights = F.softmax(raw_lambdas, dim=0)
 
-            student_feat = model.get_intermediate_features()  # (B, 128)
+                student_feat = model.get_intermediate_features()  # (B, 128)
 
-            if use_a and aligners[0] is not None and eA is not None and eA.shape[-1] == aligners[0].linear.in_features:
-                tA = aligners[0](eA)
-                kd_A_val = F.mse_loss(student_feat, tA)
-                loss = loss + weights[0] * kd_A_val
+                if use_a and aligners[0] is not None and eA is not None and eA.shape[-1] == aligners[0].linear.in_features:
+                    tA = aligners[0](eA)
+                    kd_A_val = F.mse_loss(student_feat, tA)
+                    loss = loss + weights[0] * kd_A_val
 
-            if use_b and aligners[1] is not None and eB is not None and eB.shape[-1] == aligners[1].linear.in_features:
-                tB = aligners[1](eB)
-                kd_B_val = F.mse_loss(student_feat, tB)
-                loss = loss + weights[1] * kd_B_val
+                if use_b and aligners[1] is not None and eB is not None and eB.shape[-1] == aligners[1].linear.in_features:
+                    tB = aligners[1](eB)
+                    kd_B_val = F.mse_loss(student_feat, tB)
+                    loss = loss + weights[1] * kd_B_val
 
-            if use_c and aligners[2] is not None and eC is not None and eC.shape[-1] == aligners[2].linear.in_features:
-                tC = aligners[2](eC)
-                kd_C_val = F.mse_loss(student_feat, tC)
-                loss = loss + weights[2] * kd_C_val
+                if use_c and aligners[2] is not None and eC is not None and eC.shape[-1] == aligners[2].linear.in_features:
+                    tC = aligners[2](eC)
+                    kd_C_val = F.mse_loss(student_feat, tC)
+                    loss = loss + weights[2] * kd_C_val
 
-        loss.backward()
-        optimizer.step()
+            # Scale loss for gradient accumulation
+            loss = loss / grad_accum_steps
 
-        total_loss += loss.item()
+        if SCALER is not None:
+            SCALER.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Gradient accumulation step
+        if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(loader):
+            if SCALER is not None:
+                SCALER.step(optimizer)
+                SCALER.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * grad_accum_steps
         total_ce += ce.item()
         total_kd_A += kd_A_val.item()
         total_kd_B += kd_B_val.item()
@@ -354,7 +390,7 @@ def train_epoch(model, aggregator, aligners, loader, optimizer, criterion_ce, de
 def main():
     parser = argparse.ArgumentParser(description="MT-LDI-MDS multi-teacher distillation trainer.")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs (default 50).")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (default 32).")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (default 128 for A100 40GB).")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default 1e-3).")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay (default 1e-4).")
     parser.add_argument("--device", type=str, default="cuda", help="Device: cuda or cpu (default cuda).")
@@ -364,6 +400,9 @@ def main():
                         help="Which teachers to use for KD: A, B, C, or any combination (default ABC).")
     parser.add_argument("--checkpoint", type=str, default=CHECKPOINT_PATH,
                         help="Path to save/load the best model checkpoint.")
+    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default 4).")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster training (requires PyTorch 2.0+).")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers (default 4).")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -408,15 +447,45 @@ def main():
             break
 
     # ------------------------------------------------------------------
-    # 3) Build DataLoaders
+    # 3) Build DataLoaders (A100 optimized)
     # ------------------------------------------------------------------
     train_ds = TeacherEmbeddingDataset(X_train, y_train, emb_A, emb_B, emb_C)
     val_ds = TeacherEmbeddingDataset(X_val, y_val, None, None, None)
     test_ds = TeacherEmbeddingDataset(X_test, y_test, None, None, None)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, collate_fn=collate_fn)
+    # A100 40GB: pin_memory=True, persistent_workers=True for faster data loading
+    num_workers = args.num_workers if device.type == "cuda" else 0
+    pin_memory = device.type == "cuda"
+    persistent_workers = num_workers > 0
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
 
     # ------------------------------------------------------------------
     # 4) Build models
@@ -434,6 +503,16 @@ def main():
     align_B = TeacherAligner(teacher_dim, 128).to(device) if emb_B is not None else None
     align_C = TeacherAligner(teacher_dim, 128).to(device) if emb_C is not None else None
     aligners = [align_A, align_B, align_C]
+
+    # torch.compile for faster training on A100 (PyTorch 2.0+)
+    if args.compile and device.type == "cuda":
+        print("[INFO] Compiling models with torch.compile...")
+        # Use max-autotune mode for best performance on A100
+        student = torch.compile(student, mode="max-autotune", fullgraph=False)
+        aggregator = torch.compile(aggregator, mode="max-autotune", fullgraph=False)
+        for i, al in enumerate(aligners):
+            if al is not None:
+                aligners[i] = torch.compile(al, mode="max-autotune", fullgraph=False)
 
     # ------------------------------------------------------------------
     # 5) Optimizer & scheduler
@@ -461,7 +540,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         print(f"\n=== Epoch {epoch}/{args.epochs} ===")
-        train_metrics = train_epoch(student, aggregator, aligners, train_loader, optimizer, criterion_ce, device, has_kd, kd_teachers=args.kd_teachers)
+        train_metrics = train_epoch(student, aggregator, aligners, train_loader, optimizer, criterion_ce, device, has_kd, kd_teachers=args.kd_teachers, grad_accum_steps=args.grad_accum)
         val_loss, val_ce, val_acc, val_f1 = evaluate(student, aggregator, aligners, val_loader, criterion_ce, device, kd_teachers=args.kd_teachers)
 
         scheduler.step()

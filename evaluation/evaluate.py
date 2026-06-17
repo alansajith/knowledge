@@ -34,6 +34,15 @@ from torch.utils.data import DataLoader, TensorDataset
 from utils.paths import get_project_paths
 
 # ---------------------------------------------------------------------------
+# A100 40GB Optimizations
+# ---------------------------------------------------------------------------
+# Enable TF32 for faster matmul on Ampere GPUs (A100)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# Enable cuDNN benchmark for optimal convolution algorithms
+torch.backends.cudnn.benchmark = True
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 paths = get_project_paths(__file__)
@@ -48,6 +57,10 @@ from student.bilstm_student import BiLSTMStudent
 from aggregator.weighted_aggregator import WeightedAggregator
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Mixed precision settings for A100 (BF16 preferred on Ampere)
+USE_AMP = DEVICE.type == "cuda"
+AMP_DTYPE = torch.bfloat16 if DEVICE.type == "cuda" else torch.float32
 
 ATTACK_MAP = {
     "DoS": 1, "DoSDisruptive": 1, "DoSRandom": 1,
@@ -174,10 +187,12 @@ def evaluate_checkpoint(checkpoint_path, device, test_loader):
 
     # Measure inference latency
     start = time.time()
+    autocast_enabled = USE_AMP and device.type == "cuda"
     with torch.no_grad():
         for x, y_batch in test_loader:
             x = x.to(device)
-            logits = student(x)
+            with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=autocast_enabled):
+                logits = student(x)
             probs = torch.softmax(logits, dim=1)
             preds = logits.argmax(dim=1).cpu().numpy()
             all_preds.extend(preds)

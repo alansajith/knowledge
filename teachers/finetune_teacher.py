@@ -40,8 +40,21 @@ PROJECT_ROOT = paths["PROJECT_ROOT"]
 
 TEACHER_SPLITS = {"A": "split_A.csv", "B": "split_B.csv", "C": "split_C.csv"}
 
+# ---------------------------------------------------------------------------
+# A100 40GB Optimizations
+# ---------------------------------------------------------------------------
+# Enable TF32 for faster matmul on Ampere GPUs (A100)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# Enable cuDNN benchmark for optimal convolution algorithms
+torch.backends.cudnn.benchmark = True
+
 # Device setup: prefer CUDA if available, fallback to CPU
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Mixed precision settings for A100 (BF16 preferred on Ampere)
+USE_AMP = DEVICE.type == "cuda"
+AMP_DTYPE = torch.bfloat16 if DEVICE.type == "cuda" else torch.float32
 
 # Model identifier
 HF_MODEL_NAME = "Qwen/Qwen3-8B"
@@ -124,7 +137,7 @@ def generate_jsonl_dataset(df: pd.DataFrame, out_path: str):
 # ---------------------------------------------------------------------------
 # PEFT LoRA fine-tuning (CUDA)
 # ---------------------------------------------------------------------------
-def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
+def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device, grad_accum_steps: int = 4, use_compile: bool = False):
     """Fine-tune Qwen3-8B with LoRA using PEFT + SFTTrainer on CUDA/CPU."""
     from datasets import load_dataset
     from peft import LoraConfig, get_peft_model, TaskType
@@ -146,7 +159,7 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.bfloat16,  # Use BF16 for A100
         bnb_4bit_use_double_quant=True,
     )
 
@@ -174,6 +187,16 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
 
     print(f"Device map: {device_map}")
 
+    # Enable Flash Attention 2 for A100 (requires flash-attn package)
+    # Flash Attention 2 provides significant speedup on Ampere GPUs
+    try:
+        import flash_attn
+        use_flash_attn = True
+        print("[INFO] Flash Attention 2 available - enabling for A100")
+    except ImportError:
+        use_flash_attn = False
+        print("[WARN] Flash Attention 2 not installed - using standard attention")
+
     model = AutoModelForCausalLM.from_pretrained(
         HF_MODEL_NAME,
         quantization_config=bnb_config,
@@ -181,7 +204,18 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         trust_remote_code=False,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
+        attn_implementation="flash_attention_2" if use_flash_attn else "eager",
+        use_cache=False,  # Disable KV cache for training with gradient checkpointing
     )
+
+    # Enable gradient checkpointing for memory efficiency
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+
+    # torch.compile for faster training on A100 (PyTorch 2.0+)
+    if use_compile and device.type == "cuda":
+        print("[INFO] Compiling model with torch.compile...")
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     lora_config = LoraConfig(
         r=16,
@@ -214,13 +248,13 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
     training_args = TrainingArguments(
         output_dir=os.path.join(adapter_path, "training_output"),
         num_train_epochs=3,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=8,  # Increased for A100 40GB
+        gradient_accumulation_steps=grad_accum_steps,  # Configurable gradient accumulation
         learning_rate=2e-4,
         max_grad_norm=0.3,
         warmup_steps=max(len(train_ds) // 10 * 3 // 100, 10),
         lr_scheduler_type="cosine",
-        logging_steps=100,
+        logging_steps=50,
         save_strategy="steps",
         save_steps=max(len(train_ds) // 10, 100),
         eval_strategy="steps",
@@ -230,6 +264,13 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
         fp16=False,
         report_to="none",
         remove_unused_columns=False,
+        # A100 optimizations
+        tf32=True,  # Enable TF32 for Ampere GPUs
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        gradient_checkpointing=True,  # Enable gradient checkpointing
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     trainer = SFTTrainer(
@@ -254,23 +295,38 @@ def finetune_with_peft(data_dir: str, adapter_path: str, device: torch.device):
 # ---------------------------------------------------------------------------
 # Embedding extraction (PyTorch / HF / CUDA)
 # ---------------------------------------------------------------------------
-def extract_embeddings(df: pd.DataFrame, teacher: str, batch_size: int = 16):
+def extract_embeddings(df: pd.DataFrame, teacher: str, batch_size: int = 32):
     """
     Load Qwen/Qwen3-8B via HF transformers, run all training prompts through
     the model, mean-pool the last hidden state, save as .npy.
     """
     print(f"\nLoading HF model {HF_MODEL_NAME} for embedding extraction ...")
     tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME, trust_remote_code=False)
+    
+    # Try to enable Flash Attention 2 for faster inference
+    try:
+        import flash_attn
+        use_flash_attn = True
+        print("[INFO] Flash Attention 2 available - enabling for embedding extraction")
+    except ImportError:
+        use_flash_attn = False
+        print("[WARN] Flash Attention 2 not installed - using standard attention")
+    
     model = AutoModel.from_pretrained(
         HF_MODEL_NAME,
         torch_dtype=torch.bfloat16,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=False,
+        attn_implementation="flash_attention_2" if use_flash_attn else "eager",
     )
     model.eval()
     # If device_map is None (CPU), move manually
     if DEVICE.type == "cpu":
         model = model.to(DEVICE)
+    
+    # torch.compile for faster inference on A100
+    if DEVICE.type == "cuda":
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     embeddings_list = []
     prompts = [build_instruction_prompt(row) for _, row in df.iterrows()]
@@ -301,13 +357,15 @@ def extract_embeddings(df: pd.DataFrame, teacher: str, batch_size: int = 16):
             )
             inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
-            outputs = model(**inputs, output_hidden_states=True)
-            last_hidden = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
+            # Use mixed precision (BF16) for faster inference on A100
+            with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=USE_AMP):
+                outputs = model(**inputs, output_hidden_states=True)
+                last_hidden = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
 
-            # Mean-pool over real (non-padding) tokens
-            attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(last_hidden.size()).float()
-            sum_emb = torch.sum(last_hidden * attention_mask, dim=1)
-            mean_emb = sum_emb / attention_mask.sum(dim=1).clamp(min=1e-9)
+                # Mean-pool over real (non-padding) tokens
+                attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(last_hidden.size()).float()
+                sum_emb = torch.sum(last_hidden * attention_mask, dim=1)
+                mean_emb = sum_emb / attention_mask.sum(dim=1).clamp(min=1e-9)
 
             embeddings_list.append(mean_emb.cpu().to(torch.float32).numpy())
 
@@ -351,8 +409,19 @@ def main():
     parser.add_argument(
         "--emb-batch-size",
         type=int,
-        default=16,
-        help="Batch size for embedding extraction (default: 16).",
+        default=32,
+        help="Batch size for embedding extraction (default: 32 for A100).",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps for LoRA training (default: 4).",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile for faster training (requires PyTorch 2.0+).",
     )
     args = parser.parse_args()
 
